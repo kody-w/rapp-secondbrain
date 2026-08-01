@@ -1353,7 +1353,9 @@ def cmd_calendar(brain: Brain, args, out: Out) -> int:
     else:
         path = brain.root / "artifacts" / "calendar.ics"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(ics, encoding="utf-8", newline="")
+    # Written as bytes: render_ics already emits CRLF per RFC 5545, and text
+    # mode would translate them. (Path.write_text(newline=...) is 3.10+.)
+    path.write_bytes(ics.encode("utf-8"))
 
     out.emit(
         {"ok": True, "path": str(path), "events": count},
