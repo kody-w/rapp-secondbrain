@@ -1,0 +1,1680 @@
+#!/usr/bin/env python3
+"""
+rsb — RAPP Second Brain
+
+A local-first, zero-dependency second brain for AI agents.
+
+Everything an assistant needs to act on your behalf in the real world — who you
+know, what it promised, what it heard on a phone call, what you approved, what
+you're owed — stored as a tamper-evident append-only event log on your own disk.
+
+No server. No API keys. No dependencies beyond the Python standard library.
+
+    rsb init
+    rsb contact add --name "Bella Vista" --phone "+15551234567"
+    rsb call start --to "+15551234567" --objective "book a table for 2 at 7pm Friday"
+    rsb brief
+
+Docs: https://github.com/kody-w/rapp-secondbrain
+"""
+
+from __future__ import annotations
+
+__version__ = "1.0.0"
+SPEC = "rapp-second-brain/1.0"
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator
+
+# --------------------------------------------------------------------------
+# paths
+# --------------------------------------------------------------------------
+
+DEFAULT_HOME = "~/.rapp-second-brain"
+
+
+def brain_home(override: str | None = None) -> Path:
+    raw = override or os.environ.get("RAPP_SECOND_BRAIN_HOME") or DEFAULT_HOME
+    return Path(os.path.expanduser(raw)).resolve()
+
+
+# --------------------------------------------------------------------------
+# primitives
+# --------------------------------------------------------------------------
+
+
+def now_iso() -> str:
+    """UTC timestamp, second resolution, always suffixed Z."""
+    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def canon(obj: Any) -> str:
+    """Canonical JSON — stable key order, no incidental whitespace."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def sha(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def slug(text: str, maxlen: int = 40) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return s[:maxlen] or "item"
+
+
+class BrainError(Exception):
+    """User-facing error — printed without a traceback."""
+
+
+# --------------------------------------------------------------------------
+# money — integer cents everywhere, never floats
+# --------------------------------------------------------------------------
+
+
+def to_cents(value: Any) -> int:
+    """Parse '1,234.56' / '1234.56' / 1234.56 / 123456c into integer cents."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, int):
+        return value * 100
+    if isinstance(value, float):
+        return int(round(value * 100))
+    text = str(value).strip().replace(",", "").replace("$", "")
+    if text.endswith("c"):
+        return int(text[:-1])
+    try:
+        return int(round(float(text) * 100))
+    except ValueError as exc:
+        raise BrainError(f"not a valid amount: {value!r}") from exc
+
+
+def money(cents: int, currency: str = "USD") -> str:
+    sign = "-" if cents < 0 else ""
+    cents = abs(int(cents))
+    symbol = {"USD": "$", "EUR": "\u20ac", "GBP": "\u00a3"}.get(currency.upper(), "")
+    body = f"{cents // 100:,}.{cents % 100:02d}"
+    return f"{sign}{symbol}{body}" if symbol else f"{sign}{body} {currency.upper()}"
+
+
+# --------------------------------------------------------------------------
+# time parsing — deterministic, no dependencies
+# --------------------------------------------------------------------------
+
+_WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def parse_when(text: str | None, *, ref: _dt.datetime | None = None) -> str | None:
+    """Parse a human-ish time into an ISO-8601 local timestamp.
+
+    Accepts full ISO, 'tomorrow 7pm', 'friday 19:30', '+2h', 'today', '7pm'.
+    Returns None for empty input. Raises BrainError on genuinely unparseable
+    input so a caller never silently books the wrong time.
+    """
+    if not text:
+        return None
+    raw = str(text).strip()
+    ref = ref or _dt.datetime.now()
+
+    # already ISO?
+    try:
+        parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.replace(microsecond=0).isoformat()
+    except ValueError:
+        pass
+
+    low = raw.lower()
+
+    # relative offsets: +90m, +2h, +3d
+    rel = re.fullmatch(r"\+(\d+)\s*(m|min|mins|h|hr|hrs|d|day|days)", low)
+    if rel:
+        amount, unit = int(rel.group(1)), rel.group(2)
+        delta = {
+            "m": _dt.timedelta(minutes=amount),
+            "min": _dt.timedelta(minutes=amount),
+            "mins": _dt.timedelta(minutes=amount),
+            "h": _dt.timedelta(hours=amount),
+            "hr": _dt.timedelta(hours=amount),
+            "hrs": _dt.timedelta(hours=amount),
+            "d": _dt.timedelta(days=amount),
+            "day": _dt.timedelta(days=amount),
+            "days": _dt.timedelta(days=amount),
+        }[unit]
+        return (ref + delta).replace(second=0, microsecond=0).isoformat()
+
+    # split a day-word off the front, keep the rest as a clock time
+    day = ref.date()
+    rest = low
+    matched_day = False
+
+    for word, offset in (("today", 0), ("tonight", 0), ("tomorrow", 1), ("overmorrow", 2)):
+        if low.startswith(word):
+            day = ref.date() + _dt.timedelta(days=offset)
+            rest = low[len(word) :].strip()
+            matched_day = True
+            break
+
+    if not matched_day:
+        for idx, name in enumerate(_WEEKDAYS):
+            if low.startswith(name) or low.startswith(name[:3] + " "):
+                token = name if low.startswith(name) else name[:3]
+                ahead = (idx - ref.weekday()) % 7 or 7  # always the *next* one
+                day = ref.date() + _dt.timedelta(days=ahead)
+                rest = low[len(token) :].strip()
+                matched_day = True
+                break
+
+    rest = re.sub(r"^(at|@|on)\s+", "", rest).strip()
+
+    hour, minute = None, 0
+    clock = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", rest) if rest else None
+    if clock:
+        hour = int(clock.group(1))
+        minute = int(clock.group(2) or 0)
+        meridiem = clock.group(3)
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        elif meridiem is None and low.startswith("tonight") and hour < 12:
+            hour += 12
+    elif rest:
+        raise BrainError(f"could not understand the time {text!r} (try ISO, '7pm', 'tomorrow 19:30', '+2h')")
+
+    if hour is None:
+        if not matched_day:
+            raise BrainError(f"could not understand the time {text!r}")
+        hour, minute = 9, 0  # a bare day means "morning"
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise BrainError(f"time out of range in {text!r}")
+
+    return _dt.datetime.combine(day, _dt.time(hour, minute)).isoformat()
+
+
+def human_when(iso: str | None) -> str:
+    if not iso:
+        return "unscheduled"
+    try:
+        parsed = _dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso
+    return parsed.strftime("%a %d %b %Y at %-I:%M %p") if os.name != "nt" else parsed.strftime("%a %d %b %Y at %I:%M %p")
+
+
+# --------------------------------------------------------------------------
+# phone normalisation — so "(555) 123-4567" and "+15551234567" are one contact
+# --------------------------------------------------------------------------
+
+
+def normalize_phone(raw: str | None, default_country: str = "1") -> str | None:
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if text.lower().startswith("sim:"):  # simulation handles are opaque
+        return text
+    digits = re.sub(r"[^\d+]", "", text)
+    if digits.startswith("+"):
+        return "+" + re.sub(r"\D", "", digits[1:])
+    digits = re.sub(r"\D", "", digits)
+    if not digits:
+        return None
+    if len(digits) == 10 and default_country == "1":
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1") and default_country == "1":
+        return "+" + digits
+    return "+" + digits
+
+
+# --------------------------------------------------------------------------
+# the log
+# --------------------------------------------------------------------------
+
+GENESIS = "sha256:" + "0" * 64
+
+
+class Brain:
+    """Append-only, hash-chained event log plus derived projections.
+
+    The log is the truth. Projections are a pure fold over it and can always be
+    thrown away and rebuilt — which is what makes the brain auditable: you can
+    prove exactly which event caused the assistant to believe anything.
+    """
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.log_path = root / "events.jsonl"
+        self.cache_path = root / ".cache" / "state.json"
+        self._state: dict | None = None
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def exists(self) -> bool:
+        return self.log_path.exists()
+
+    def init(self, *, owner: str | None = None) -> dict:
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / ".cache").mkdir(exist_ok=True)
+        (self.root / "artifacts").mkdir(exist_ok=True)
+        if not self.log_path.exists():
+            self.log_path.touch()
+        gitignore = self.root / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text(".cache/\nartifacts/\nsecrets*\n*.pem\n", encoding="utf-8")
+        return self.append("brain.init", {"owner": owner or os.environ.get("USER", "owner"), "spec": SPEC, "version": __version__})
+
+    def require(self) -> None:
+        if not self.exists():
+            raise BrainError(f"no brain at {self.root} — run `rsb init` first")
+
+    # -- writing -----------------------------------------------------------
+
+    def _last_hash(self) -> tuple[str, int]:
+        prev, seq = GENESIS, 0
+        for event in self.read():
+            prev, seq = event["hash"], event["seq"]
+        return prev, seq
+
+    def append(self, event_type: str, payload: dict, *, actor: str = "cli") -> dict:
+        self.root.mkdir(parents=True, exist_ok=True)
+        prev, seq = self._last_hash()
+        body = {
+            "seq": seq + 1,
+            "id": new_id("ev"),
+            "ts": now_iso(),
+            "type": event_type,
+            "actor": actor,
+            "payload": payload,
+            "prev": prev,
+        }
+        body["hash"] = sha(canon(body))
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(canon(body) + "\n")
+        self._state = None
+        if self.cache_path.exists():
+            self.cache_path.unlink()
+        return body
+
+    # -- reading -----------------------------------------------------------
+
+    def read(self) -> Iterator[dict]:
+        if not self.log_path.exists():
+            return
+        with self.log_path.open("r", encoding="utf-8") as handle:
+            for lineno, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise BrainError(f"corrupt event log at line {lineno}: {exc}") from exc
+
+    def verify(self) -> tuple[bool, list[str]]:
+        problems: list[str] = []
+        prev, expected_seq = GENESIS, 1
+        for event in self.read():
+            if event.get("prev") != prev:
+                problems.append(f"seq {event.get('seq')}: broken chain (prev mismatch)")
+            if event.get("seq") != expected_seq:
+                problems.append(f"expected seq {expected_seq}, found {event.get('seq')}")
+            body = {k: v for k, v in event.items() if k != "hash"}
+            if sha(canon(body)) != event.get("hash"):
+                problems.append(f"seq {event.get('seq')}: hash mismatch (event was edited)")
+            prev = event.get("hash", prev)
+            expected_seq = (event.get("seq") or expected_seq) + 1
+        return (not problems), problems
+
+    def state(self) -> dict:
+        if self._state is None:
+            self._state = fold(self.read())
+        return self._state
+
+
+# --------------------------------------------------------------------------
+# projections — a pure fold over the log
+# --------------------------------------------------------------------------
+
+
+def empty_state() -> dict:
+    return {
+        "owner": None,
+        "contacts": {},
+        "calls": {},
+        "appointments": {},
+        "approvals": {},
+        "leads": {},
+        "quotes": {},
+        "invoices": {},
+        "notes": [],
+        "prefs": {},
+        "counts": {},
+    }
+
+
+def fold(events: Iterable[dict]) -> dict:
+    state = empty_state()
+    total = 0
+
+    for event in events:
+        total += 1
+        kind = event.get("type", "")
+        data = event.get("payload") or {}
+        state["counts"][kind] = state["counts"].get(kind, 0) + 1
+
+        if kind == "brain.init":
+            state["owner"] = data.get("owner")
+
+        elif kind == "contact.upsert":
+            existing = state["contacts"].get(data["id"], {})
+            merged = {**existing, **{k: v for k, v in data.items() if v is not None}}
+            merged.setdefault("created_at", event["ts"])
+            merged["updated_at"] = event["ts"]
+            state["contacts"][data["id"]] = merged
+
+        elif kind == "note.add":
+            state["notes"].append({**data, "ts": event["ts"], "seq": event["seq"]})
+
+        elif kind == "pref.set":
+            state["prefs"][data["key"]] = data["value"]
+
+        elif kind == "call.start":
+            state["calls"][data["id"]] = {
+                **data,
+                "status": "in_progress",
+                "turns": [],
+                "started_at": event["ts"],
+            }
+
+        elif kind == "call.turn":
+            call = state["calls"].get(data["call_id"])
+            if call is not None:
+                call["turns"].append({"role": data["role"], "text": data["text"], "ts": event["ts"]})
+
+        elif kind == "call.end":
+            call = state["calls"].get(data["call_id"])
+            if call is not None:
+                call.update(
+                    status="ended",
+                    outcome=data.get("outcome", "unknown"),
+                    success=bool(data.get("success")),
+                    summary=data.get("summary", ""),
+                    ended_at=event["ts"],
+                )
+
+        elif kind == "appointment.propose":
+            state["appointments"][data["id"]] = {**data, "status": "proposed", "created_at": event["ts"]}
+
+        elif kind in ("appointment.confirm", "appointment.cancel"):
+            appointment = state["appointments"].get(data["id"])
+            if appointment is not None:
+                appointment["status"] = "confirmed" if kind.endswith("confirm") else "cancelled"
+                appointment["updated_at"] = event["ts"]
+                for key in ("start", "end", "location", "external_id", "reason"):
+                    if data.get(key) is not None:
+                        appointment[key] = data[key]
+
+        elif kind == "approval.request":
+            state["approvals"][data["id"]] = {**data, "status": "pending", "created_at": event["ts"]}
+
+        elif kind == "approval.decide":
+            approval = state["approvals"].get(data["id"])
+            if approval is not None:
+                approval["status"] = data["decision"]
+                approval["decided_at"] = event["ts"]
+                approval["decided_via"] = data.get("via", "cli")
+                approval["decision_note"] = data.get("note", "")
+
+        elif kind == "lead.add":
+            state["leads"][data["id"]] = {**data, "status": data.get("status", "new"), "created_at": event["ts"]}
+
+        elif kind == "lead.status":
+            lead = state["leads"].get(data["id"])
+            if lead is not None:
+                lead["status"] = data["status"]
+                lead["updated_at"] = event["ts"]
+
+        elif kind == "quote.create":
+            state["quotes"][data["id"]] = {**data, "status": "draft", "created_at": event["ts"]}
+
+        elif kind == "quote.status":
+            quote = state["quotes"].get(data["id"])
+            if quote is not None:
+                quote["status"] = data["status"]
+                quote["updated_at"] = event["ts"]
+
+        elif kind == "invoice.create":
+            state["invoices"][data["id"]] = {**data, "status": "unpaid", "created_at": event["ts"]}
+
+        elif kind == "invoice.pay":
+            invoice = state["invoices"].get(data["id"])
+            if invoice is not None:
+                invoice["status"] = "paid"
+                invoice["paid_at"] = event["ts"]
+                invoice["paid_via"] = data.get("via", "")
+
+        elif kind == "doc.render":
+            for bucket in ("quotes", "invoices"):
+                record = state[bucket].get(data.get("ref", ""))
+                if record is not None:
+                    record.setdefault("docs", []).append({"path": data["path"], "format": data["format"], "ts": event["ts"]})
+
+    state["counts"]["_total"] = total
+    return state
+
+
+# --------------------------------------------------------------------------
+# lookup helpers
+# --------------------------------------------------------------------------
+
+
+def find_contact(state: dict, needle: str | None) -> dict | None:
+    """Resolve a contact by id, exact phone, or case-insensitive name substring."""
+    if not needle:
+        return None
+    contacts = state["contacts"]
+    if needle in contacts:
+        return contacts[needle]
+
+    phone = normalize_phone(needle)
+    if phone:
+        for contact in contacts.values():
+            if contact.get("phone") == phone:
+                return contact
+
+    low = needle.lower()
+    exact = [c for c in contacts.values() if (c.get("name") or "").lower() == low]
+    if exact:
+        return exact[0]
+    partial = [c for c in contacts.values() if low in (c.get("name") or "").lower()]
+    return partial[0] if len(partial) >= 1 else None
+
+
+def resolve(state: dict, bucket: str, key: str) -> dict:
+    """Resolve an id, tolerating unambiguous short prefixes."""
+    records = state[bucket]
+    if key in records:
+        return records[key]
+    hits = [record for rid, record in records.items() if rid.endswith(key) or rid.startswith(key)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise BrainError(f"no {bucket[:-1]} matching {key!r}")
+    raise BrainError(f"{key!r} is ambiguous — matches {len(hits)} {bucket}")
+
+
+def line_items(raw: list[str] | None) -> tuple[list[dict], int]:
+    """Parse repeated --item 'Description x2 @ 150.00' flags into structured rows."""
+    items: list[dict] = []
+    total = 0
+    for entry in raw or []:
+        text = entry.strip()
+        match = re.match(r"^(.*?)(?:\s+x\s*(\d+(?:\.\d+)?))?\s*@\s*([\d.,$]+)$", text, re.IGNORECASE)
+        if not match:
+            raise BrainError(f"bad --item {entry!r} — use 'Description x2 @ 150.00'")
+        description = match.group(1).strip()
+        qty = float(match.group(2) or 1)
+        unit_cents = to_cents(match.group(3))
+        amount = int(round(unit_cents * qty))
+        items.append({"description": description, "qty": qty, "unit_cents": unit_cents, "amount_cents": amount})
+        total += amount
+    return items, total
+
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+
+class Out:
+    def __init__(self, as_json: bool):
+        self.as_json = as_json
+
+    def emit(self, payload: dict, text: str = "") -> None:
+        if self.as_json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        elif text:
+            print(text)
+
+    def table(self, rows: list[list[str]], headers: list[str]) -> str:
+        if not rows:
+            return "  (none)"
+        widths = [len(h) for h in headers]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(str(cell)))
+        out = ["  " + "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip()]
+        out.append("  " + "  ".join("-" * widths[i] for i in range(len(headers))))
+        for row in rows:
+            out.append("  " + "  ".join(str(c).ljust(widths[i]) for i, c in enumerate(row)).rstrip())
+        return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+
+def cmd_init(brain: Brain, args, out: Out) -> int:
+    fresh = not brain.exists()
+    event = brain.init(owner=args.owner)
+    out.emit(
+        {"ok": True, "root": str(brain.root), "created": fresh, "spec": SPEC, "version": __version__},
+        f"{'Created' if fresh else 'Re-initialised'} RAPP Second Brain at {brain.root}\n"
+        f"  spec {SPEC}   event {event['seq']}\n\n"
+        f"Next: rsb contact add --name 'Someone' --phone '+1555...'",
+    )
+    return 0
+
+
+def cmd_note(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    if args.note_cmd == "add":
+        payload = {"text": args.text, "tags": args.tag or [], "source": args.source or "cli"}
+        event = brain.append("note.add", payload, actor=args.actor)
+        out.emit({"ok": True, "seq": event["seq"], "note": payload}, f"Remembered (event {event['seq']}).")
+        return 0
+
+    notes = brain.state()["notes"]
+    query = (args.query or "").lower()
+    tags = set(args.tag or [])
+    hits = [
+        n
+        for n in notes
+        if (not query or query in n["text"].lower())
+        and (not tags or tags & set(n.get("tags") or []))
+    ]
+    hits = hits[-args.limit :]
+    out.emit(
+        {"ok": True, "count": len(hits), "notes": hits},
+        "\n".join(f"  [{n['ts']}] {n['text']}" + (f"  #{' #'.join(n['tags'])}" if n.get("tags") else "") for n in hits)
+        or "  (nothing remembered yet)",
+    )
+    return 0
+
+
+def cmd_contact(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    state = brain.state()
+
+    if args.contact_cmd == "add":
+        existing = find_contact(state, normalize_phone(args.phone) or args.name)
+        contact_id = existing["id"] if existing else new_id("ct")
+        payload = {
+            "id": contact_id,
+            "name": args.name,
+            "phone": normalize_phone(args.phone),
+            "email": args.email,
+            "org": args.org,
+            "role": args.role,
+            "notes": args.notes,
+            "tags": args.tag or None,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
+        brain.append("contact.upsert", payload, actor=args.actor)
+        out.emit(
+            {"ok": True, "contact": payload, "updated": bool(existing)},
+            f"{'Updated' if existing else 'Added'} contact {payload.get('name', contact_id)} ({contact_id}).",
+        )
+        return 0
+
+    if args.contact_cmd == "find":
+        contact = find_contact(state, args.query)
+        if not contact:
+            out.emit({"ok": False, "error": "not found", "query": args.query}, f"No contact matching {args.query!r}.")
+            return 1
+        out.emit({"ok": True, "contact": contact}, _render_contact(contact))
+        return 0
+
+    contacts = sorted(state["contacts"].values(), key=lambda c: (c.get("name") or "").lower())
+    rows = [[c.get("name", ""), c.get("phone", ""), c.get("org", ""), c["id"]] for c in contacts]
+    out.emit({"ok": True, "count": len(contacts), "contacts": contacts}, out.table(rows, ["NAME", "PHONE", "ORG", "ID"]))
+    return 0
+
+
+def _render_contact(contact: dict) -> str:
+    lines = [f"{contact.get('name', '(unnamed)')}  [{contact['id']}]"]
+    for label, key in (("phone", "phone"), ("email", "email"), ("org", "org"), ("role", "role"), ("notes", "notes")):
+        if contact.get(key):
+            lines.append(f"  {label:6} {contact[key]}")
+    if contact.get("tags"):
+        lines.append(f"  tags   {' '.join(contact['tags'])}")
+    return "\n".join(lines)
+
+
+def cmd_call(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    state = brain.state()
+
+    if args.call_cmd == "start":
+        contact = find_contact(state, args.to)
+        phone = normalize_phone(args.to) or (contact or {}).get("phone")
+        if not phone:
+            raise BrainError(f"cannot resolve a phone number from {args.to!r}")
+        payload = {
+            "id": new_id("call"),
+            "direction": args.direction,
+            "peer": phone,
+            "contact_id": (contact or {}).get("id"),
+            "contact_name": (contact or {}).get("name"),
+            "objective": args.objective,
+            "constraints": args.constraint or [],
+            "provider": args.provider,
+        }
+        brain.append("call.start", payload, actor=args.actor)
+        out.emit(
+            {"ok": True, "call": payload},
+            f"Call {payload['id']} started — {args.direction} {phone}\n  objective: {args.objective or '(none)'}",
+        )
+        return 0
+
+    if args.call_cmd == "turn":
+        call = resolve(state, "calls", args.call)
+        payload = {"call_id": call["id"], "role": args.role, "text": args.text}
+        event = brain.append("call.turn", payload, actor=args.actor)
+        out.emit({"ok": True, "seq": event["seq"], "turn": payload}, f"  {args.role}: {args.text}")
+        return 0
+
+    if args.call_cmd == "end":
+        call = resolve(state, "calls", args.call)
+        payload = {
+            "call_id": call["id"],
+            "outcome": args.outcome,
+            "success": args.success,
+            "summary": args.summary or "",
+        }
+        brain.append("call.end", payload, actor=args.actor)
+        out.emit(
+            {"ok": True, "call_id": call["id"], "outcome": args.outcome, "success": args.success},
+            f"Call {call['id']} ended — {args.outcome} ({'success' if args.success else 'no deal'}).",
+        )
+        return 0
+
+    if args.call_cmd == "show":
+        call = resolve(state, "calls", args.call)
+        transcript = "\n".join(f"  {t['role']:6} {t['text']}" for t in call.get("turns", []))
+        out.emit(
+            {"ok": True, "call": call},
+            f"Call {call['id']}  {call['direction']} {call['peer']}  [{call.get('status')}]\n"
+            f"  objective: {call.get('objective') or '(none)'}\n"
+            f"  outcome:   {call.get('outcome', '-')}\n\n{transcript or '  (no transcript)'}",
+        )
+        return 0
+
+    calls = sorted(state["calls"].values(), key=lambda c: c.get("started_at", ""), reverse=True)[: args.limit]
+    rows = [
+        [c.get("started_at", "")[:16], c["direction"], c.get("contact_name") or c["peer"], c.get("status", ""), c.get("outcome", "-"), c["id"]]
+        for c in calls
+    ]
+    out.emit({"ok": True, "count": len(calls), "calls": calls}, out.table(rows, ["WHEN", "DIR", "PEER", "STATUS", "OUTCOME", "ID"]))
+    return 0
+
+
+def cmd_appointment(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    state = brain.state()
+
+    if args.appointment_cmd == "propose":
+        contact = find_contact(state, args.with_)
+        payload = {
+            "id": new_id("appt"),
+            "title": args.title,
+            "with": (contact or {}).get("name") or args.with_,
+            "contact_id": (contact or {}).get("id"),
+            "start": parse_when(args.start),
+            "end": parse_when(args.end),
+            "location": args.location,
+            "call_id": args.call,
+            "notes": args.notes,
+        }
+        brain.append("appointment.propose", payload, actor=args.actor)
+        out.emit(
+            {"ok": True, "appointment": payload},
+            f"Proposed {payload['id']}: {payload['title']} with {payload['with']} — {human_when(payload['start'])}",
+        )
+        return 0
+
+    if args.appointment_cmd in ("confirm", "cancel"):
+        appointment = resolve(state, "appointments", args.id)
+        payload = {"id": appointment["id"]}
+        if args.appointment_cmd == "confirm":
+            if args.start:
+                payload["start"] = parse_when(args.start)
+            if args.end:
+                payload["end"] = parse_when(args.end)
+            if getattr(args, "external_id", None):
+                payload["external_id"] = args.external_id
+        elif getattr(args, "reason", None):
+            payload["reason"] = args.reason
+        brain.append(f"appointment.{args.appointment_cmd}", payload, actor=args.actor)
+        merged = {**appointment, **payload}
+        out.emit(
+            {"ok": True, "appointment_id": appointment["id"], "status": "confirmed" if args.appointment_cmd == "confirm" else "cancelled"},
+            f"{args.appointment_cmd.title()}ed {appointment['id']} — {merged.get('title')} {human_when(merged.get('start'))}",
+        )
+        return 0
+
+    appointments = sorted(state["appointments"].values(), key=lambda a: a.get("start") or "")
+    if args.status:
+        appointments = [a for a in appointments if a["status"] == args.status]
+    rows = [[human_when(a.get("start")), a.get("title", ""), a.get("with", ""), a["status"], a["id"]] for a in appointments]
+    out.emit({"ok": True, "count": len(appointments), "appointments": appointments}, out.table(rows, ["WHEN", "TITLE", "WITH", "STATUS", "ID"]))
+    return 0
+
+
+def cmd_approval(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    state = brain.state()
+
+    if args.approval_cmd == "request":
+        payload = {
+            "id": new_id("apr"),
+            "subject": args.subject,
+            "detail": args.detail or "",
+            "options": args.option or ["approve", "deny"],
+            "ref": args.ref,
+            "channel": args.channel,
+            "expires_at": parse_when(args.expires),
+        }
+        brain.append("approval.request", payload, actor=args.actor)
+        out.emit(
+            {"ok": True, "approval": payload},
+            f"Approval {payload['id']} requested: {payload['subject']}\n  {payload['detail']}",
+        )
+        return 0
+
+    if args.approval_cmd in ("approve", "deny"):
+        approval = resolve(state, "approvals", args.id)
+        if approval["status"] != "pending":
+            raise BrainError(f"approval {approval['id']} is already {approval['status']}")
+        payload = {"id": approval["id"], "decision": args.approval_cmd, "via": args.via, "note": args.note or ""}
+        brain.append("approval.decide", payload, actor=args.actor)
+        out.emit(
+            {"ok": True, "approval_id": approval["id"], "decision": args.approval_cmd, "ref": approval.get("ref")},
+            f"{args.approval_cmd.title()}d {approval['id']} — {approval['subject']}",
+        )
+        return 0
+
+    if args.approval_cmd == "check":
+        approval = resolve(state, "approvals", args.id)
+        out.emit(
+            {"ok": True, "approval": approval, "pending": approval["status"] == "pending", "granted": approval["status"] == "approve"},
+            f"{approval['id']}  {approval['status']}  {approval['subject']}",
+        )
+        return 0 if approval["status"] == "approve" else 1
+
+    approvals = sorted(state["approvals"].values(), key=lambda a: a.get("created_at", ""), reverse=True)
+    if args.pending:
+        approvals = [a for a in approvals if a["status"] == "pending"]
+    rows = [[a.get("created_at", "")[:16], a["status"], a["subject"][:48], a["id"]] for a in approvals]
+    out.emit({"ok": True, "count": len(approvals), "approvals": approvals}, out.table(rows, ["WHEN", "STATUS", "SUBJECT", "ID"]))
+    return 0
+
+
+def cmd_lead(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    state = brain.state()
+
+    if args.lead_cmd == "add":
+        contact = find_contact(state, args.contact or args.name)
+        contact_id = (contact or {}).get("id")
+        if not contact and (args.name or args.phone):
+            contact_id = new_id("ct")
+            brain.append(
+                "contact.upsert",
+                {k: v for k, v in {"id": contact_id, "name": args.name, "phone": normalize_phone(args.phone)}.items() if v},
+                actor=args.actor,
+            )
+            state = brain.state()
+        payload = {
+            "id": new_id("lead"),
+            "name": args.name or (contact or {}).get("name"),
+            "contact_id": contact_id,
+            "source": args.source or "unknown",
+            "need": args.need or "",
+            "value_cents": to_cents(args.value),
+            "currency": args.currency,
+            "status": "new",
+        }
+        brain.append("lead.add", payload, actor=args.actor)
+        out.emit(
+            {"ok": True, "lead": payload},
+            f"Lead {payload['id']}: {payload['name']} — {payload['need'] or '(no need captured)'} "
+            f"({money(payload['value_cents'], payload['currency'])})",
+        )
+        return 0
+
+    if args.lead_cmd == "status":
+        lead = resolve(state, "leads", args.id)
+        brain.append("lead.status", {"id": lead["id"], "status": args.status}, actor=args.actor)
+        out.emit({"ok": True, "lead_id": lead["id"], "status": args.status}, f"Lead {lead['id']} → {args.status}")
+        return 0
+
+    leads = sorted(state["leads"].values(), key=lambda l: l.get("created_at", ""), reverse=True)
+    rows = [[l.get("name", ""), l.get("status", ""), money(l.get("value_cents", 0), l.get("currency", "USD")), (l.get("need") or "")[:32], l["id"]] for l in leads]
+    out.emit({"ok": True, "count": len(leads), "leads": leads}, out.table(rows, ["NAME", "STATUS", "VALUE", "NEED", "ID"]))
+    return 0
+
+
+def _doc_record(brain: Brain, args, out: Out, kind: str) -> int:
+    """Shared implementation for quote/invoice creation."""
+    state = brain.state()
+    items, subtotal = line_items(args.item)
+    tax_cents = int(round(subtotal * (args.tax or 0) / 100))
+    total = subtotal + tax_cents
+
+    lead = None
+    if args.lead:
+        lead = resolve(state, "leads", args.lead)
+    contact = find_contact(state, args.to or (lead or {}).get("contact_id"))
+
+    payload = {
+        "id": new_id("q" if kind == "quote" else "inv"),
+        "number": args.number or _next_number(state, kind),
+        "lead_id": (lead or {}).get("id"),
+        "contact_id": (contact or {}).get("id"),
+        "bill_to": (contact or {}).get("name") or args.to or (lead or {}).get("name") or "Customer",
+        "title": args.title or ("Quote" if kind == "quote" else "Invoice"),
+        "items": items,
+        "subtotal_cents": subtotal,
+        "tax_percent": args.tax or 0,
+        "tax_cents": tax_cents,
+        "total_cents": total,
+        "currency": args.currency,
+        "notes": args.notes or "",
+        "due": parse_when(args.due) if getattr(args, "due", None) else None,
+        "valid_until": parse_when(args.valid_until) if getattr(args, "valid_until", None) else None,
+    }
+    brain.append(f"{kind}.create", payload, actor=args.actor)
+
+    rendered = None
+    if args.render:
+        rendered = render_document(brain, payload, kind, args.render)
+        brain.append("doc.render", {"ref": payload["id"], "path": str(rendered), "format": args.render}, actor=args.actor)
+
+    text = (
+        f"{kind.title()} {payload['number']} ({payload['id']}) for {payload['bill_to']}\n"
+        + "\n".join(f"  {i['description']}  x{i['qty']:g}  {money(i['amount_cents'], args.currency)}" for i in items)
+        + f"\n  {'-' * 30}\n  total {money(total, args.currency)}"
+    )
+    if rendered:
+        text += f"\n  document: {rendered}"
+    out.emit({"ok": True, kind: payload, "document": str(rendered) if rendered else None}, text)
+    return 0
+
+
+def _next_number(state: dict, kind: str) -> str:
+    prefix = "Q" if kind == "quote" else "INV"
+    year = _dt.date.today().year
+    count = len(state["quotes"] if kind == "quote" else state["invoices"]) + 1
+    return f"{prefix}-{year}-{count:04d}"
+
+
+def cmd_quote(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    if args.quote_cmd == "create":
+        return _doc_record(brain, args, out, "quote")
+    if args.quote_cmd == "status":
+        quote = resolve(brain.state(), "quotes", args.id)
+        brain.append("quote.status", {"id": quote["id"], "status": args.status}, actor=args.actor)
+        out.emit({"ok": True, "quote_id": quote["id"], "status": args.status}, f"Quote {quote['id']} → {args.status}")
+        return 0
+    quotes = sorted(brain.state()["quotes"].values(), key=lambda q: q.get("created_at", ""), reverse=True)
+    rows = [[q["number"], q["bill_to"], money(q["total_cents"], q["currency"]), q["status"], q["id"]] for q in quotes]
+    out.emit({"ok": True, "count": len(quotes), "quotes": quotes}, out.table(rows, ["NUMBER", "BILL TO", "TOTAL", "STATUS", "ID"]))
+    return 0
+
+
+def cmd_invoice(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    if args.invoice_cmd == "create":
+        return _doc_record(brain, args, out, "invoice")
+    if args.invoice_cmd == "pay":
+        invoice = resolve(brain.state(), "invoices", args.id)
+        brain.append("invoice.pay", {"id": invoice["id"], "via": args.via or ""}, actor=args.actor)
+        out.emit({"ok": True, "invoice_id": invoice["id"], "status": "paid"}, f"Invoice {invoice['number']} marked paid.")
+        return 0
+    invoices = sorted(brain.state()["invoices"].values(), key=lambda i: i.get("created_at", ""), reverse=True)
+    if args.unpaid:
+        invoices = [i for i in invoices if i["status"] != "paid"]
+    rows = [[i["number"], i["bill_to"], money(i["total_cents"], i["currency"]), i["status"], i["id"]] for i in invoices]
+    out.emit({"ok": True, "count": len(invoices), "invoices": invoices}, out.table(rows, ["NUMBER", "BILL TO", "TOTAL", "STATUS", "ID"]))
+    return 0
+
+
+def cmd_pref(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    if args.pref_cmd == "set":
+        brain.append("pref.set", {"key": args.key, "value": args.value}, actor=args.actor)
+        out.emit({"ok": True, "key": args.key, "value": args.value}, f"{args.key} = {args.value}")
+        return 0
+    prefs = brain.state()["prefs"]
+    if getattr(args, "key", None):
+        value = prefs.get(args.key)
+        out.emit({"ok": value is not None, "key": args.key, "value": value}, str(value) if value is not None else "")
+        return 0 if value is not None else 1
+    out.emit({"ok": True, "prefs": prefs}, "\n".join(f"  {k} = {v}" for k, v in sorted(prefs.items())) or "  (none)")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# document rendering — HTML (printable to PDF) and Markdown, zero deps
+# --------------------------------------------------------------------------
+
+
+def render_document(brain: Brain, record: dict, kind: str, fmt: str) -> Path:
+    artifacts = brain.root / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    name = f"{record['number']}-{slug(record['bill_to'])}"
+    currency = record.get("currency", "USD")
+
+    if fmt in ("md", "markdown"):
+        lines = [
+            f"# {record['title']} {record['number']}",
+            "",
+            f"**Bill to:** {record['bill_to']}  ",
+            f"**Date:** {_dt.date.today().isoformat()}  ",
+        ]
+        if record.get("due"):
+            lines.append(f"**Due:** {human_when(record['due'])}  ")
+        if record.get("valid_until"):
+            lines.append(f"**Valid until:** {human_when(record['valid_until'])}  ")
+        lines += ["", "| Description | Qty | Unit | Amount |", "| --- | ---: | ---: | ---: |"]
+        for item in record["items"]:
+            lines.append(
+                f"| {item['description']} | {item['qty']:g} | {money(item['unit_cents'], currency)} | {money(item['amount_cents'], currency)} |"
+            )
+        lines += ["", f"**Subtotal:** {money(record['subtotal_cents'], currency)}  "]
+        if record.get("tax_cents"):
+            lines.append(f"**Tax ({record['tax_percent']}%):** {money(record['tax_cents'], currency)}  ")
+        lines.append(f"**Total:** {money(record['total_cents'], currency)}")
+        if record.get("notes"):
+            lines += ["", "---", "", record["notes"]]
+        path = artifacts / f"{name}.md"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    rows = "".join(
+        f"<tr><td>{_esc(i['description'])}</td><td class=n>{i['qty']:g}</td>"
+        f"<td class=n>{money(i['unit_cents'], currency)}</td><td class=n>{money(i['amount_cents'], currency)}</td></tr>"
+        for i in record["items"]
+    )
+    tax_row = (
+        f"<tr><td colspan=3 class=n>Tax ({record['tax_percent']}%)</td><td class=n>{money(record['tax_cents'], currency)}</td></tr>"
+        if record.get("tax_cents")
+        else ""
+    )
+    meta = f"<div><b>Date</b> {_dt.date.today().isoformat()}</div>"
+    if record.get("due"):
+        meta += f"<div><b>Due</b> {human_when(record['due'])}</div>"
+    if record.get("valid_until"):
+        meta += f"<div><b>Valid until</b> {human_when(record['valid_until'])}</div>"
+
+    html = f"""<!doctype html><meta charset=utf-8><title>{_esc(record['title'])} {record['number']}</title>
+<style>
+ body{{font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,sans-serif;color:#111;max-width:760px;margin:48px auto;padding:0 24px}}
+ h1{{font-size:26px;margin:0 0 4px}} .sub{{color:#666;margin-bottom:28px}}
+ .head{{display:flex;justify-content:space-between;gap:24px;margin-bottom:28px}}
+ .head div div{{margin-bottom:2px}} b{{color:#666;font-weight:600;display:inline-block;min-width:86px}}
+ table{{width:100%;border-collapse:collapse;margin:8px 0 16px}}
+ th,td{{padding:9px 10px;border-bottom:1px solid #e5e5e5;text-align:left}}
+ th{{background:#fafafa;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#666}}
+ .n{{text-align:right;font-variant-numeric:tabular-nums}}
+ .total td{{border-top:2px solid #111;border-bottom:none;font-weight:700;font-size:17px;padding-top:12px}}
+ .notes{{margin-top:32px;padding-top:16px;border-top:1px solid #eee;color:#444;white-space:pre-wrap}}
+ footer{{margin-top:48px;color:#999;font-size:12px}}
+ @media print{{body{{margin:0}}}}
+</style>
+<h1>{_esc(record['title'])} {record['number']}</h1>
+<div class=sub>{'Quotation' if kind == 'quote' else 'Invoice'}</div>
+<div class=head><div><div><b>Bill to</b> {_esc(record['bill_to'])}</div></div><div>{meta}</div></div>
+<table><thead><tr><th>Description</th><th class=n>Qty</th><th class=n>Unit</th><th class=n>Amount</th></tr></thead>
+<tbody>{rows}
+<tr><td colspan=3 class=n>Subtotal</td><td class=n>{money(record['subtotal_cents'], currency)}</td></tr>{tax_row}
+<tr class=total><td colspan=3 class=n>Total</td><td class=n>{money(record['total_cents'], currency)}</td></tr></tbody></table>
+{f'<div class=notes>{_esc(record["notes"])}</div>' if record.get('notes') else ''}
+<footer>Generated by RAPP Second Brain \u00b7 {record['id']}</footer>
+"""
+    path = artifacts / f"{name}.html"
+    path.write_text(html, encoding="utf-8")
+    return path
+
+
+def _esc(text: Any) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+# --------------------------------------------------------------------------
+# brief / context — what the assistant should know before it acts
+# --------------------------------------------------------------------------
+
+
+def build_brief(state: dict) -> dict:
+    today = _dt.date.today().isoformat()
+    upcoming = sorted(
+        [a for a in state["appointments"].values() if a["status"] == "confirmed" and (a.get("start") or "") >= today],
+        key=lambda a: a.get("start") or "",
+    )
+    pending = [a for a in state["approvals"].values() if a["status"] == "pending"]
+    open_leads = [l for l in state["leads"].values() if l.get("status") not in ("won", "lost")]
+    unpaid = [i for i in state["invoices"].values() if i["status"] != "paid"]
+    recent_calls = sorted(state["calls"].values(), key=lambda c: c.get("started_at", ""), reverse=True)[:5]
+    return {
+        "generated_at": now_iso(),
+        "owner": state.get("owner"),
+        "upcoming_appointments": upcoming[:10],
+        "pending_approvals": pending,
+        "open_leads": sorted(open_leads, key=lambda l: l.get("value_cents", 0), reverse=True)[:10],
+        "unpaid_invoices": unpaid,
+        "unpaid_total_cents": sum(i["total_cents"] for i in unpaid),
+        "recent_calls": [
+            {"id": c["id"], "peer": c.get("contact_name") or c["peer"], "outcome": c.get("outcome"), "when": c.get("started_at")}
+            for c in recent_calls
+        ],
+        "recent_notes": state["notes"][-8:],
+        "prefs": state["prefs"],
+        "totals": {
+            "contacts": len(state["contacts"]),
+            "calls": len(state["calls"]),
+            "appointments": len(state["appointments"]),
+            "leads": len(state["leads"]),
+            "invoices": len(state["invoices"]),
+        },
+    }
+
+
+def cmd_brief(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    brief = build_brief(brain.state())
+    if out.as_json:
+        out.emit(brief)
+        return 0
+
+    lines = [f"RAPP Second Brain — brief for {brief['owner'] or 'you'}  ({brief['generated_at']})", ""]
+
+    lines.append("Upcoming")
+    lines += [f"  {human_when(a.get('start'))}  {a.get('title')} with {a.get('with')}" for a in brief["upcoming_appointments"]] or ["  (nothing scheduled)"]
+
+    if brief["pending_approvals"]:
+        lines += ["", "Waiting on you"]
+        lines += [f"  [{a['id']}] {a['subject']}" for a in brief["pending_approvals"]]
+
+    if brief["open_leads"]:
+        lines += ["", "Open leads"]
+        lines += [f"  {money(l.get('value_cents', 0), l.get('currency', 'USD')):>12}  {l.get('name')} — {l.get('status')}" for l in brief["open_leads"]]
+
+    if brief["unpaid_invoices"]:
+        lines += ["", f"Unpaid invoices — {money(brief['unpaid_total_cents'])}"]
+        lines += [f"  {i['number']}  {i['bill_to']}  {money(i['total_cents'], i['currency'])}" for i in brief["unpaid_invoices"]]
+
+    if brief["recent_calls"]:
+        lines += ["", "Recent calls"]
+        lines += [f"  {(c['when'] or '')[:16]}  {c['peer']} — {c['outcome'] or 'in progress'}" for c in brief["recent_calls"]]
+
+    print("\n".join(lines))
+    return 0
+
+
+def cmd_context(brain: Brain, args, out: Out) -> int:
+    """Emit a compact block for injection into an LLM system prompt."""
+    brain.require()
+    state = brain.state()
+    brief = build_brief(state)
+    parts = ["<second_brain>"]
+    if brief["owner"]:
+        parts.append(f"owner: {brief['owner']}")
+    if state["prefs"]:
+        parts.append("preferences:")
+        parts += [f"  - {k}: {v}" for k, v in sorted(state["prefs"].items())]
+    if brief["upcoming_appointments"]:
+        parts.append("upcoming:")
+        parts += [f"  - {human_when(a.get('start'))} — {a.get('title')} with {a.get('with')}" for a in brief["upcoming_appointments"][:5]]
+    if brief["pending_approvals"]:
+        parts.append("awaiting your approval:")
+        parts += [f"  - [{a['id']}] {a['subject']}" for a in brief["pending_approvals"]]
+    if brief["recent_notes"]:
+        parts.append("remembered:")
+        parts += [f"  - {n['text']}" for n in brief["recent_notes"]]
+    if brief["unpaid_invoices"]:
+        parts.append(f"unpaid invoices: {len(brief['unpaid_invoices'])} totalling {money(brief['unpaid_total_cents'])}")
+    parts.append("</second_brain>")
+    text = "\n".join(parts)
+    out.emit({"ok": True, "context": text}, text)
+    return 0
+
+
+def cmd_recall(brain: Brain, args, out: Out) -> int:
+    """Full-text search across everything the brain holds."""
+    brain.require()
+    state = brain.state()
+    query = args.query.lower()
+    hits: list[dict] = []
+
+    def consider(kind: str, ident: str, label: str, haystack: str, record: Any) -> None:
+        if query in haystack.lower():
+            hits.append({"kind": kind, "id": ident, "label": label, "record": record})
+
+    for contact in state["contacts"].values():
+        consider("contact", contact["id"], contact.get("name", ""), canon(contact), contact)
+    for note in state["notes"]:
+        consider("note", f"seq:{note['seq']}", note["text"][:70], note["text"] + " " + " ".join(note.get("tags") or []), note)
+    for call in state["calls"].values():
+        blob = (call.get("objective") or "") + " " + (call.get("summary") or "") + " " + " ".join(t["text"] for t in call.get("turns", []))
+        consider("call", call["id"], f"{call.get('contact_name') or call['peer']} — {call.get('outcome', 'in progress')}", blob, call)
+    for appointment in state["appointments"].values():
+        consider("appointment", appointment["id"], f"{appointment.get('title')} {human_when(appointment.get('start'))}", canon(appointment), appointment)
+    for lead in state["leads"].values():
+        consider("lead", lead["id"], f"{lead.get('name')} — {lead.get('need', '')[:40]}", canon(lead), lead)
+    for bucket, kind in (("quotes", "quote"), ("invoices", "invoice")):
+        for record in state[bucket].values():
+            consider(kind, record["id"], f"{record['number']} {record['bill_to']}", canon(record), record)
+
+    hits = hits[: args.limit]
+    out.emit(
+        {"ok": True, "query": args.query, "count": len(hits), "hits": hits},
+        "\n".join(f"  {h['kind']:12} {h['label']}  [{h['id']}]" for h in hits) or f"  (nothing matches {args.query!r})",
+    )
+    return 0 if hits else 1
+
+
+# --------------------------------------------------------------------------
+# integrity / plumbing
+# --------------------------------------------------------------------------
+
+
+def cmd_log(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    events = list(brain.read())
+    if args.type:
+        events = [e for e in events if e["type"] == args.type]
+    events = events[-args.limit :]
+    out.emit(
+        {"ok": True, "count": len(events), "events": events},
+        "\n".join(f"  {e['seq']:>4}  {e['ts']}  {e['type']:24} {canon(e['payload'])[:90]}" for e in events),
+    )
+    return 0
+
+
+def cmd_verify(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    ok, problems = brain.verify()
+    total = brain.state()["counts"].get("_total", 0)
+    out.emit(
+        {"ok": ok, "events": total, "problems": problems},
+        f"Chain intact — {total} events verified." if ok else "TAMPERING DETECTED\n" + "\n".join(f"  {p}" for p in problems),
+    )
+    return 0 if ok else 2
+
+
+def cmd_export(brain: Brain, args, out: Out) -> int:
+    brain.require()
+    bundle = {
+        "spec": SPEC,
+        "version": __version__,
+        "exported_at": now_iso(),
+        "state": brain.state(),
+        "events": list(brain.read()) if args.include_log else None,
+    }
+    if args.output:
+        path = Path(os.path.expanduser(args.output))
+        path.write_text(json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8")
+        out.emit({"ok": True, "path": str(path)}, f"Exported to {path}")
+    else:
+        print(json.dumps(bundle, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_doctor(brain: Brain, args, out: Out) -> int:
+    checks = []
+    checks.append({"check": "python", "ok": sys.version_info >= (3, 9), "detail": sys.version.split()[0]})
+    checks.append({"check": "brain_exists", "ok": brain.exists(), "detail": str(brain.root)})
+    if brain.exists():
+        ok, problems = brain.verify()
+        checks.append({"check": "chain_integrity", "ok": ok, "detail": "; ".join(problems) or "intact"})
+        state = brain.state()
+        checks.append({"check": "events", "ok": True, "detail": str(state["counts"].get("_total", 0))})
+        writable = os.access(brain.root, os.W_OK)
+        checks.append({"check": "writable", "ok": writable, "detail": "yes" if writable else "NO"})
+    healthy = all(c["ok"] for c in checks)
+    out.emit(
+        {"ok": healthy, "checks": checks},
+        "\n".join(f"  [{'ok' if c['ok'] else 'FAIL'}] {c['check']:18} {c['detail']}" for c in checks),
+    )
+    return 0 if healthy else 1
+
+
+# --------------------------------------------------------------------------
+# MCP server (stdio, JSON-RPC 2.0) — zero dependency
+# --------------------------------------------------------------------------
+
+MCP_TOOLS = [
+    ("second_brain_brief", "Everything the assistant should know right now: upcoming appointments, pending approvals, open leads, unpaid invoices, recent calls.", {}),
+    ("second_brain_recall", "Full-text search across contacts, notes, call transcripts, appointments, leads, quotes and invoices.", {"query": {"type": "string", "description": "What to search for"}}),
+    ("second_brain_remember", "Store a durable fact about the owner or their world.", {"text": {"type": "string", "description": "The fact to remember"}}),
+    ("second_brain_contact_find", "Look up a contact by name, phone number or id.", {"query": {"type": "string", "description": "Name, phone or id"}}),
+    ("second_brain_pending_approvals", "List approvals the owner has not yet decided.", {}),
+]
+
+
+def cmd_mcp(brain: Brain, args, out: Out) -> int:
+    def respond(request_id: Any, result: dict | None = None, error: dict | None = None) -> None:
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id}
+        if error:
+            message["error"] = error
+        else:
+            message["result"] = result
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        method, request_id = request.get("method"), request.get("id")
+
+        if method == "initialize":
+            respond(request_id, {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "rapp-second-brain", "version": __version__},
+            })
+        elif method == "tools/list":
+            respond(request_id, {
+                "tools": [
+                    {
+                        "name": name,
+                        "description": description,
+                        "inputSchema": {"type": "object", "properties": props, "required": list(props.keys())},
+                    }
+                    for name, description, props in MCP_TOOLS
+                ]
+            })
+        elif method == "tools/call":
+            params = request.get("params") or {}
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            try:
+                payload = _mcp_dispatch(brain, name, arguments)
+                respond(request_id, {"content": [{"type": "text", "text": json.dumps(payload, indent=2, ensure_ascii=False)}]})
+            except Exception as exc:  # surfaced to the model, never crashes the server
+                respond(request_id, {"content": [{"type": "text", "text": f"error: {exc}"}], "isError": True})
+        elif method and method.startswith("notifications/"):
+            continue
+        elif request_id is not None:
+            respond(request_id, error={"code": -32601, "message": f"unknown method {method}"})
+    return 0
+
+
+def _mcp_dispatch(brain: Brain, name: str, arguments: dict) -> dict:
+    brain.require()
+    state = brain.state()
+    if name == "second_brain_brief":
+        return build_brief(state)
+    if name == "second_brain_recall":
+        query = (arguments.get("query") or "").lower()
+        found = [n for n in state["notes"] if query in n["text"].lower()]
+        contacts = [c for c in state["contacts"].values() if query in canon(c).lower()]
+        calls = [
+            {"id": c["id"], "peer": c.get("contact_name") or c["peer"], "objective": c.get("objective"), "outcome": c.get("outcome")}
+            for c in state["calls"].values()
+            if query in canon(c).lower()
+        ]
+        return {"query": arguments.get("query"), "notes": found, "contacts": contacts, "calls": calls}
+    if name == "second_brain_remember":
+        event = brain.append("note.add", {"text": arguments["text"], "tags": [], "source": "mcp"}, actor="mcp")
+        return {"ok": True, "seq": event["seq"]}
+    if name == "second_brain_contact_find":
+        contact = find_contact(state, arguments.get("query"))
+        return {"found": bool(contact), "contact": contact}
+    if name == "second_brain_pending_approvals":
+        return {"approvals": [a for a in state["approvals"].values() if a["status"] == "pending"]}
+    raise BrainError(f"unknown tool {name}")
+
+
+# --------------------------------------------------------------------------
+# HTTP server — for webhooks (telephony providers, Telegram, cron)
+# --------------------------------------------------------------------------
+
+
+def cmd_serve(brain: Brain, args, out: Out) -> int:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    brain.require()
+    token = args.token or os.environ.get("RAPP_SECOND_BRAIN_TOKEN")
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = f"rapp-second-brain/{__version__}"
+
+        def _send(self, code: int, payload: dict) -> None:
+            body = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authorised(self) -> bool:
+            if not token:
+                return True
+            supplied = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+            return supplied == token
+
+        def log_message(self, fmt: str, *fmt_args: Any) -> None:
+            if args.verbose:
+                sys.stderr.write("  " + fmt % fmt_args + "\n")
+
+        def do_GET(self) -> None:  # noqa: N802
+            if not self._authorised():
+                return self._send(401, {"error": "unauthorized"})
+            route = self.path.split("?")[0].rstrip("/") or "/"
+            if route == "/":
+                return self._send(200, {"service": "rapp-second-brain", "version": __version__, "spec": SPEC})
+            if route == "/brief":
+                return self._send(200, build_brief(Brain(brain.root).state()))
+            if route == "/health":
+                ok, problems = Brain(brain.root).verify()
+                return self._send(200 if ok else 500, {"ok": ok, "problems": problems})
+            if route.startswith("/state"):
+                return self._send(200, Brain(brain.root).state())
+            self._send(404, {"error": "not found"})
+
+        def do_POST(self) -> None:  # noqa: N802
+            if not self._authorised():
+                return self._send(401, {"error": "unauthorized"})
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+            try:
+                body = json.loads(raw or "{}")
+            except json.JSONDecodeError:
+                return self._send(400, {"error": "invalid json"})
+            route = self.path.split("?")[0].rstrip("/")
+            if route == "/event":
+                event_type, payload = body.get("type"), body.get("payload") or {}
+                if not event_type:
+                    return self._send(400, {"error": "type required"})
+                event = Brain(brain.root).append(event_type, payload, actor=body.get("actor", "http"))
+                return self._send(201, {"ok": True, "seq": event["seq"], "hash": event["hash"]})
+            if route == "/remember":
+                event = Brain(brain.root).append("note.add", {"text": body.get("text", ""), "tags": body.get("tags") or [], "source": "http"}, actor="http")
+                return self._send(201, {"ok": True, "seq": event["seq"]})
+            self._send(404, {"error": "not found"})
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    sys.stderr.write(f"RAPP Second Brain listening on http://{args.host}:{args.port}  (brain: {brain.root})\n")
+    if not token:
+        sys.stderr.write("  warning: no --token set; bind to localhost only\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nstopped\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# argument parsing
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="rsb",
+        description="RAPP Second Brain — local-first memory and records for AI agents.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Docs: https://github.com/kody-w/rapp-secondbrain",
+    )
+    parser.add_argument("--home", help="brain directory (default $RAPP_SECOND_BRAIN_HOME or ~/.rapp-second-brain)")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--actor", default="cli", help="who is writing (cli, jarvis, telegram, hotline...)")
+    parser.add_argument("--version", action="version", version=f"rsb {__version__} ({SPEC})")
+    subs = parser.add_subparsers(dest="command", required=True)
+
+    init = subs.add_parser("init", help="create the brain")
+    init.add_argument("--owner")
+    init.set_defaults(func=cmd_init)
+
+    # -- note ---------------------------------------------------------------
+    note = subs.add_parser("note", help="durable facts (alias: remember)")
+    note_subs = note.add_subparsers(dest="note_cmd", required=True)
+    note_add = note_subs.add_parser("add")
+    note_add.add_argument("text")
+    note_add.add_argument("--tag", action="append")
+    note_add.add_argument("--source")
+    note_list = note_subs.add_parser("list")
+    note_list.add_argument("query", nargs="?")
+    note_list.add_argument("--tag", action="append")
+    note_list.add_argument("--limit", type=int, default=20)
+    note.set_defaults(func=cmd_note)
+
+    remember = subs.add_parser("remember", help="shorthand for `note add`")
+    remember.add_argument("text")
+    remember.add_argument("--tag", action="append")
+    remember.add_argument("--source")
+    remember.set_defaults(func=cmd_note, note_cmd="add")
+
+    # -- contact ------------------------------------------------------------
+    contact = subs.add_parser("contact", help="people and places")
+    contact_subs = contact.add_subparsers(dest="contact_cmd", required=True)
+    contact_add = contact_subs.add_parser("add")
+    contact_add.add_argument("--name", required=True)
+    for flag in ("--phone", "--email", "--org", "--role", "--notes"):
+        contact_add.add_argument(flag)
+    contact_add.add_argument("--tag", action="append")
+    contact_find = contact_subs.add_parser("find")
+    contact_find.add_argument("query")
+    contact_subs.add_parser("list")
+    contact.set_defaults(func=cmd_contact)
+
+    # -- call ---------------------------------------------------------------
+    call = subs.add_parser("call", help="phone calls and transcripts")
+    call_subs = call.add_subparsers(dest="call_cmd", required=True)
+    call_start = call_subs.add_parser("start")
+    call_start.add_argument("--to", required=True)
+    call_start.add_argument("--direction", choices=["outbound", "inbound"], default="outbound")
+    call_start.add_argument("--objective")
+    call_start.add_argument("--constraint", action="append")
+    call_start.add_argument("--provider", default="unknown")
+    call_turn = call_subs.add_parser("turn")
+    call_turn.add_argument("--call", required=True)
+    call_turn.add_argument("--role", choices=["agent", "peer", "owner", "system"], required=True)
+    call_turn.add_argument("--text", required=True)
+    call_end = call_subs.add_parser("end")
+    call_end.add_argument("--call", required=True)
+    call_end.add_argument("--outcome", required=True)
+    call_end.add_argument("--success", action="store_true")
+    call_end.add_argument("--summary")
+    call_show = call_subs.add_parser("show")
+    call_show.add_argument("call")
+    call_list = call_subs.add_parser("list")
+    call_list.add_argument("--limit", type=int, default=20)
+    call.set_defaults(func=cmd_call, limit=20)
+
+    # -- appointment --------------------------------------------------------
+    appointment = subs.add_parser("appointment", help="proposed and confirmed commitments")
+    appointment_subs = appointment.add_subparsers(dest="appointment_cmd", required=True)
+    propose = appointment_subs.add_parser("propose")
+    propose.add_argument("--title", required=True)
+    propose.add_argument("--with", dest="with_")
+    propose.add_argument("--start")
+    propose.add_argument("--end")
+    propose.add_argument("--location")
+    propose.add_argument("--call")
+    propose.add_argument("--notes")
+    confirm = appointment_subs.add_parser("confirm")
+    confirm.add_argument("id")
+    confirm.add_argument("--start")
+    confirm.add_argument("--end")
+    confirm.add_argument("--external-id", dest="external_id")
+    cancel = appointment_subs.add_parser("cancel")
+    cancel.add_argument("id")
+    cancel.add_argument("--reason")
+    appointment_list = appointment_subs.add_parser("list")
+    appointment_list.add_argument("--status", choices=["proposed", "confirmed", "cancelled"])
+    appointment.set_defaults(func=cmd_appointment, status=None)
+
+    # -- approval -----------------------------------------------------------
+    approval = subs.add_parser("approval", help="human-in-the-loop decisions")
+    approval_subs = approval.add_subparsers(dest="approval_cmd", required=True)
+    request = approval_subs.add_parser("request")
+    request.add_argument("--subject", required=True)
+    request.add_argument("--detail")
+    request.add_argument("--option", action="append")
+    request.add_argument("--ref", help="id of the thing being approved (appointment, quote...)")
+    request.add_argument("--channel", default="any")
+    request.add_argument("--expires")
+    for verb in ("approve", "deny"):
+        node = approval_subs.add_parser(verb)
+        node.add_argument("id")
+        node.add_argument("--via", default="cli")
+        node.add_argument("--note")
+    check = approval_subs.add_parser("check")
+    check.add_argument("id")
+    approval_list = approval_subs.add_parser("list")
+    approval_list.add_argument("--pending", action="store_true")
+    approval.set_defaults(func=cmd_approval, pending=False)
+
+    # -- lead ---------------------------------------------------------------
+    lead = subs.add_parser("lead", help="pipeline")
+    lead_subs = lead.add_subparsers(dest="lead_cmd", required=True)
+    lead_add = lead_subs.add_parser("add")
+    lead_add.add_argument("--name")
+    lead_add.add_argument("--contact")
+    lead_add.add_argument("--phone")
+    lead_add.add_argument("--source")
+    lead_add.add_argument("--need")
+    lead_add.add_argument("--value", default="0")
+    lead_add.add_argument("--currency", default="USD")
+    lead_status = lead_subs.add_parser("status")
+    lead_status.add_argument("id")
+    lead_status.add_argument("status", choices=["new", "contacted", "quoted", "won", "lost"])
+    lead_subs.add_parser("list")
+    lead.set_defaults(func=cmd_lead)
+
+    # -- quote / invoice ----------------------------------------------------
+    def add_document_flags(node: argparse.ArgumentParser) -> None:
+        node.add_argument("--to", help="contact name, phone or id")
+        node.add_argument("--lead")
+        node.add_argument("--title")
+        node.add_argument("--number")
+        node.add_argument("--item", action="append", required=True, help="'Description x2 @ 150.00' (repeatable)")
+        node.add_argument("--tax", type=float, default=0)
+        node.add_argument("--currency", default="USD")
+        node.add_argument("--notes")
+        node.add_argument("--render", choices=["html", "md"], help="also write a document to artifacts/")
+
+    quote = subs.add_parser("quote", help="quotations")
+    quote_subs = quote.add_subparsers(dest="quote_cmd", required=True)
+    quote_create = quote_subs.add_parser("create")
+    add_document_flags(quote_create)
+    quote_create.add_argument("--valid-until", dest="valid_until")
+    quote_status = quote_subs.add_parser("status")
+    quote_status.add_argument("id")
+    quote_status.add_argument("status", choices=["draft", "sent", "accepted", "rejected"])
+    quote_subs.add_parser("list")
+    quote.set_defaults(func=cmd_quote)
+
+    invoice = subs.add_parser("invoice", help="invoices")
+    invoice_subs = invoice.add_subparsers(dest="invoice_cmd", required=True)
+    invoice_create = invoice_subs.add_parser("create")
+    add_document_flags(invoice_create)
+    invoice_create.add_argument("--due")
+    invoice_pay = invoice_subs.add_parser("pay")
+    invoice_pay.add_argument("id")
+    invoice_pay.add_argument("--via")
+    invoice_list = invoice_subs.add_parser("list")
+    invoice_list.add_argument("--unpaid", action="store_true")
+    invoice.set_defaults(func=cmd_invoice, unpaid=False)
+
+    # -- pref ---------------------------------------------------------------
+    pref = subs.add_parser("pref", help="owner preferences the agent must respect")
+    pref_subs = pref.add_subparsers(dest="pref_cmd", required=True)
+    pref_set = pref_subs.add_parser("set")
+    pref_set.add_argument("key")
+    pref_set.add_argument("value")
+    pref_get = pref_subs.add_parser("get")
+    pref_get.add_argument("key")
+    pref_subs.add_parser("list")
+    pref.set_defaults(func=cmd_pref)
+
+    # -- readouts -----------------------------------------------------------
+    brief = subs.add_parser("brief", help="what matters right now")
+    brief.set_defaults(func=cmd_brief)
+
+    context = subs.add_parser("context", help="system-prompt block for an LLM")
+    context.set_defaults(func=cmd_context)
+
+    recall = subs.add_parser("recall", help="search everything")
+    recall.add_argument("query")
+    recall.add_argument("--limit", type=int, default=20)
+    recall.set_defaults(func=cmd_recall)
+
+    log = subs.add_parser("log", help="raw event log")
+    log.add_argument("--limit", type=int, default=30)
+    log.add_argument("--type")
+    log.set_defaults(func=cmd_log)
+
+    verify = subs.add_parser("verify", help="prove the log has not been edited")
+    verify.set_defaults(func=cmd_verify)
+
+    export = subs.add_parser("export", help="dump the whole brain")
+    export.add_argument("--output", "-o")
+    export.add_argument("--include-log", action="store_true")
+    export.set_defaults(func=cmd_export)
+
+    doctor = subs.add_parser("doctor", help="health check")
+    doctor.set_defaults(func=cmd_doctor)
+
+    serve = subs.add_parser("serve", help="HTTP API for webhooks")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=7431)
+    serve.add_argument("--token")
+    serve.add_argument("--verbose", action="store_true")
+    serve.set_defaults(func=cmd_serve)
+
+    mcp = subs.add_parser("mcp", help="MCP server over stdio")
+    mcp.set_defaults(func=cmd_mcp)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    brain = Brain(brain_home(args.home))
+    out = Out(args.json)
+    try:
+        return args.func(brain, args, out)
+    except BrainError as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
