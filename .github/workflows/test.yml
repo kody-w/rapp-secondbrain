@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Run the suite (no dependencies to install)
-        run: python3 tests/test_rsb.py
+        run: python3 tests/run.py
       - name: Installer must work from a clean checkout
         run: |
           RSB_PREFIX="$RUNNER_TEMP/bin" RAPP_SECOND_BRAIN_HOME="$RUNNER_TEMP/brain" bash install.sh

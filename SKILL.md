@@ -160,3 +160,22 @@ rsb serve --port 7431 --token "$TOKEN"   # HTTP: GET /brief /state /health, POST
 - The brain lives at `$RAPP_SECOND_BRAIN_HOME` (default `~/.rapp-second-brain/`).
 - Nothing is ever deleted — status changes are new events. That is the point.
 - No API keys, no network, no dependencies beyond the Python standard library.
+
+## Running inside a RAPP brainstem
+
+If you are a brainstem agent rather than a shell, you do not need `rsb` at all:
+`agents/second_brain_agent.py` is the same brain, same log, same spec, reachable as
+the `SecondBrain` tool.
+
+```
+SecondBrain(action="brief")
+SecondBrain(action="recall", query="bella vista")
+SecondBrain(action="remember", text="Kody is allergic to shellfish")
+SecondBrain(action="propose_appointment", title="Dinner", start="2026-08-07T19:45")
+SecondBrain(action="request_approval", title="7:45 instead of 7:00?", query="<appointment id>")
+SecondBrain(action="confirm_appointment", query="<appointment id>")
+```
+
+`confirm_appointment` **refuses** while any approval referencing that appointment is
+still pending or denied. The gate is in the agent, not in the prompt — so it holds
+even when the model is convinced it should not.

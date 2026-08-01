@@ -139,9 +139,9 @@ construction. Nothing is ever deleted — a cancellation is a new event, not a r
 **Skill** — hand [`SKILL.md`](SKILL.md) to any harness that reads skills and it knows
 the whole CLI, including the rules about when *not* to act.
 
-**RAPP brainstem** — drop [`agents/second_brain_agent.py`](agents/second_brain_agent.py)
-into your `agents/` folder. It implements `system_context()`, so the brain's state is
-injected into every single turn automatically.
+**RAPP brainstem** — drop [`agents/second_brain_agent.py`](agents/second_brain_agent.py) into
+your `agents/` folder. It follows the grail agent ABI exactly, so it is discovered
+automatically and needs no wiring. See [Runs on the grail kernel](#runs-on-the-grail-kernel).
 
 **HTTP** — for telephony/Telegram webhooks:
 
@@ -151,6 +151,52 @@ rsb serve --port 7431 --token "$RAPP_SECOND_BRAIN_TOKEN"
 ```
 
 **Anything else** — every command speaks `--json` and returns meaningful exit codes.
+
+## Runs on the grail kernel
+
+`agents/second_brain_agent.py` is a **second, independent implementation of the same
+spec** — one file, one class extending `BasicAgent`, one `metadata` dict, one
+`perform(**kwargs) -> str`, and every byte of I/O through the storage shim.
+
+That last part is what makes it portable. It imports nothing but `json`, `hashlib`,
+`datetime` and `uuid` — no subprocess, no sockets, no filesystem paths — so the same
+file runs unmodified across every tier the kernel supports:
+
+| | |
+|---|---|
+| **Tier 1** | local brainstem (`rapp_brainstem/`) |
+| **Tier 2** | Azure Functions swarm |
+| **Tier 3** | Copilot Studio |
+| **Sphere** | Pyodide, in a browser tab |
+
+A test enforces this by parsing the agent's AST and rejecting any import outside that
+allowlist, so it cannot quietly regress.
+
+It also implements `system_context()`, so the brain's state — preferences, what's
+scheduled, what's awaiting your approval — is injected into **every turn's** system
+prompt without the model having to think to ask.
+
+### One brain, two implementations
+
+`rsb` and the brainstem agent write the *same hash-chained log*, in the same canonical
+encoding. They are interchangeable readers and writers:
+
+```
+your phone agent  ──┐
+the browser sphere ─┼──►  events.jsonl  ◄── your terminal (rsb)
+a cron job        ──┘
+```
+
+This is tested, not asserted — the suite interleaves writes from both implementations
+and requires the chain to verify from either side, and requires an approval granted by
+one to unlock a booking in the other:
+
+```
+test_interleaved_writes_keep_one_unbroken_chain ... ok
+test_rsb_can_verify_a_log_the_agent_wrote       ... ok
+test_agent_reads_what_rsb_wrote                 ... ok
+test_the_approval_gate_agrees_across_both       ... ok
+```
 
 ## The design rule
 
@@ -174,13 +220,18 @@ said yes" is a fact rather than a claim. That's the whole idea.
 ## Tests
 
 ```bash
-python3 tests/test_rsb.py
+python3 tests/run.py
 ```
 
-47 tests, stdlib `unittest`, no fixtures to install. They cover the hash chain
-(including tamper and deletion detection), phone/time/money parsing, HTML escaping,
-the MCP protocol, and a full end-to-end reproduction of the call → negotiate →
-call back → approve → confirm flow.
+70 tests, stdlib `unittest`, nothing to install. They cover the hash chain (including
+tamper and deletion detection), phone/time/money parsing, HTML escaping, the MCP
+protocol, the grail agent ABI, tier-portability enforcement, cross-implementation
+interop, and a full end-to-end reproduction of the call → negotiate → call back →
+approve → confirm flow.
+
+```bash
+./examples/jarvis-restaurant-call.sh    # watch the whole flow run
+```
 
 ## Not to be confused with
 
