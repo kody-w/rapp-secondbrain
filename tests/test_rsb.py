@@ -11,6 +11,7 @@ import datetime as _dt
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -282,6 +283,178 @@ class TestDocuments(BrainTestCase):
         self.assertEqual(self.run_cli("invoice", "list", "--unpaid")["count"], 1)
         self.run_cli("invoice", "pay", invoice_id, "--via", "bank transfer")
         self.assertEqual(self.run_cli("invoice", "list", "--unpaid")["count"], 0)
+
+
+class TestPdf(BrainTestCase):
+    """An invoice you cannot send is not an invoice."""
+
+    def make(self, **kwargs) -> Path:
+        args = ["invoice", "create", "--to", kwargs.pop("to", "Acme Ltd"), "--render", "pdf"]
+        for item in kwargs.pop("items", ["Consulting x10 @ 150.00"]):
+            args += ["--item", item]
+        for flag, value in kwargs.items():
+            args += [f"--{flag.replace('_', '-')}", str(value)]
+        return Path(self.run_cli(*args)["document"])
+
+    def read_text_runs(self, path: Path) -> list[str]:
+        raw = path.read_bytes().decode("latin-1")
+        stream = raw.split("stream", 1)[1].rsplit("endstream", 1)[0]
+        return re.findall(r"\((.*?)\) Tj", stream)
+
+    def test_produces_a_real_pdf(self) -> None:
+        self.init()
+        path = self.make()
+        data = path.read_bytes()
+        self.assertTrue(path.name.endswith(".pdf"))
+        self.assertTrue(data.startswith(b"%PDF-1.4"))
+        self.assertTrue(data.rstrip().endswith(b"%%EOF"))
+        self.assertIn(b"/Type /Catalog", data)
+        self.assertIn(b"xref", data)
+
+    def test_xref_offsets_are_correct(self) -> None:
+        """A wrong offset produces a file that opens in nothing."""
+        self.init()
+        data = self.make().read_bytes()
+
+        start = int(data.rsplit(b"startxref", 1)[1].split(b"%%EOF")[0].strip())
+        self.assertEqual(data[start : start + 4], b"xref")
+
+        table = data[start:].split(b"\n")[2:]
+        for index, row in enumerate(table, start=1):
+            if not re.match(rb"^\d{10} \d{5} n", row):
+                break
+            offset = int(row.split(b" ")[0])
+            self.assertEqual(data[offset : offset + len(str(index)) + 6], f"{index} 0 obj".encode())
+
+    def test_contains_the_numbers(self) -> None:
+        self.init()
+        path = self.make(items=["Deep clean x4 @ 300.00", "Call-out @ 175.50"], tax=8.25)
+        runs = self.read_text_runs(path)
+        self.assertIn("$1,200.00", runs)
+        self.assertIn("$175.50", runs)
+        self.assertIn("Total", runs)
+        # subtotal 1375.50 + 8.25% tax (113.48) = 1488.98
+        self.assertIn("$1,375.50", runs)
+        self.assertIn("$1,488.98", runs)
+
+    def test_handles_non_ascii_without_corrupting_the_file(self) -> None:
+        self.init()
+        path = self.make(to="Riverside Caf\u00e9", items=["Nettoyage \u00e0 sec @ 50.00"])
+        self.assertTrue(path.read_bytes().startswith(b"%PDF"))
+        self.assertIn("Riverside Caf\u00e9", self.read_text_runs(path))
+
+    def test_escapes_pdf_syntax_in_user_text(self) -> None:
+        """Unescaped parens would terminate the string and corrupt the page."""
+        self.init()
+        path = self.make(to="Acme (Holdings) \\ Co")
+        data = path.read_bytes()
+        self.assertTrue(data.startswith(b"%PDF"))
+        self.assertIn(r"Acme \(Holdings\) \\ Co", self.read_text_runs(path))
+
+    def test_text_width_matches_helvetica_metrics(self) -> None:
+        # 'i' is narrow, 'W' is wide — a right-aligned column depends on this.
+        self.assertLess(rsb.text_width("iiii", 12), rsb.text_width("WWWW", 12))
+        self.assertAlmostEqual(rsb.text_width("A", 1000), 667, places=0)
+        self.assertAlmostEqual(rsb.text_width("A", 1000, bold=True), 722, places=0)
+
+    def test_quotes_render_too(self) -> None:
+        self.init()
+        result = self.run_cli("quote", "create", "--to", "Acme", "--item", "Work @ 10.00", "--render", "pdf")
+        self.assertTrue(Path(result["document"]).exists())
+
+
+class TestCalendar(BrainTestCase):
+    """A booking that never reaches a calendar has not really happened."""
+
+    def confirmed_appointment(self, **kwargs) -> str:
+        args = ["appointment", "propose", "--title", kwargs.pop("title", "Dinner")]
+        for flag, value in kwargs.items():
+            args += [f"--{flag}", str(value)]
+        appointment_id = self.run_cli(*args)["appointment"]["id"]
+        self.run_cli("appointment", "confirm", appointment_id)
+        return appointment_id
+
+    def ics(self) -> str:
+        path = Path(self.run_cli("calendar")["path"])
+        return path.read_bytes().decode("utf-8")
+
+    def test_emits_rfc5545(self) -> None:
+        self.init()
+        self.confirmed_appointment(start="2026-08-07T19:45")
+        body = self.ics()
+
+        self.assertTrue(body.startswith("BEGIN:VCALENDAR\r\n"))
+        self.assertTrue(body.rstrip().endswith("END:VCALENDAR"))
+        self.assertIn("VERSION:2.0", body)
+        self.assertIn("DTSTART:20260807T194500", body)
+        self.assertIn("STATUS:CONFIRMED", body)
+
+    def test_uses_crlf_everywhere(self) -> None:
+        """Bare LF is the classic reason a feed silently fails to import."""
+        self.init()
+        self.confirmed_appointment(start="2026-08-07T19:45")
+        raw = Path(self.run_cli("calendar")["path"]).read_bytes()
+        self.assertEqual(raw.count(b"\n") - raw.count(b"\r\n"), 0)
+
+    def test_escapes_separators(self) -> None:
+        self.init()
+        self.confirmed_appointment(
+            title="Dinner; table for 2, window", location="12 High St, Anytown", start="2026-08-07T19:45"
+        )
+        body = self.ics()
+        self.assertIn(r"SUMMARY:Dinner\; table for 2\, window", body)
+        self.assertIn(r"LOCATION:12 High St\, Anytown", body)
+
+    def test_folds_long_lines_to_75_octets(self) -> None:
+        self.init()
+        self.confirmed_appointment(title="A " + "very " * 40 + "long title", start="2026-08-07T19:45")
+        raw = Path(self.run_cli("calendar")["path"]).read_bytes()
+        for line in raw.split(b"\r\n"):
+            self.assertLessEqual(len(line), 75, f"unfolded line: {line[:90]!r}")
+        # and it must still be readable once unfolded
+        self.assertIn("very very", raw.decode("utf-8").replace("\r\n ", ""))
+
+    def test_only_confirmed_by_default(self) -> None:
+        self.init()
+        self.confirmed_appointment(start="2026-08-07T19:45")
+        self.run_cli("appointment", "propose", "--title", "Just a hold", "--start", "2026-08-09T10:00")
+
+        self.assertEqual(self.ics().count("BEGIN:VEVENT"), 1)
+        self.assertNotIn("Just a hold", self.ics())
+
+        path = Path(self.run_cli("calendar", "--include-proposed")["path"])
+        body = path.read_bytes().decode("utf-8")
+        self.assertEqual(body.count("BEGIN:VEVENT"), 2)
+        self.assertIn("STATUS:TENTATIVE", body)
+
+    def test_cancelled_appointments_disappear(self) -> None:
+        self.init()
+        appointment_id = self.confirmed_appointment(start="2026-08-07T19:45")
+        self.run_cli("appointment", "cancel", appointment_id)
+        self.assertEqual(self.ics().count("BEGIN:VEVENT"), 0)
+
+    def test_default_duration_is_an_hour(self) -> None:
+        self.init()
+        self.confirmed_appointment(start="2026-08-07T19:45")
+        body = self.ics()
+        self.assertIn("DTSTART:20260807T194500", body)
+        self.assertIn("DTEND:20260807T204500", body)
+
+    def test_uid_is_stable_across_regeneration(self) -> None:
+        """Regenerating must update the event, not duplicate it."""
+        self.init()
+        appointment_id = self.confirmed_appointment(start="2026-08-07T19:45")
+        first, second = self.ics(), self.ics()
+        self.assertIn(f"UID:{appointment_id}@rapp-second-brain", first)
+        self.assertEqual(
+            [line for line in first.split("\r\n") if line.startswith("UID:")],
+            [line for line in second.split("\r\n") if line.startswith("UID:")],
+        )
+
+    def test_appointment_without_a_time_is_skipped(self) -> None:
+        self.init()
+        self.confirmed_appointment(title="No time given")
+        self.assertEqual(self.ics().count("BEGIN:VEVENT"), 0)
 
 
 class TestRecall(BrainTestCase):

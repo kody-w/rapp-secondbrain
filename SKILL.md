@@ -125,8 +125,32 @@ rsb invoice pay <invoice-id> --via card
 integer cents — never do arithmetic on the formatted strings.
 
 `--render html` writes a print-ready document to `~/.rapp-second-brain/artifacts/`
-(open it and Print → Save as PDF). `--render md` writes Markdown, which is what you
+(open it and Print → Save as PDF). `--render pdf` writes a real PDF directly — no
+dependencies, no headless browser. `--render md` writes Markdown, which is what you
 paste into Google Docs when you need an editable version.
+
+## Calendar
+
+A booking that never reaches a calendar has not really happened.
+
+```bash
+rsb calendar                      # writes artifacts/calendar.ics
+rsb calendar -o ~/Desktop/me.ics
+rsb calendar --include-proposed   # unconfirmed holds, as TENTATIVE
+```
+
+Only **confirmed** appointments are exported by default — a proposal the owner has
+not approved must not appear as a commitment.
+
+For a live feed that Google Calendar, Apple Calendar and Outlook can subscribe to:
+
+```bash
+rsb serve --port 7431 --token "$TOKEN"
+# http://127.0.0.1:7431/$TOKEN/calendar.ics
+```
+
+The token is in the path because a calendar client cannot send an `Authorization`
+header. Every other route still requires the bearer token.
 
 ## Preferences — the owner's standing orders
 

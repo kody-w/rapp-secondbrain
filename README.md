@@ -106,6 +106,32 @@ Recent calls
 | **notes** | durable facts, tagged and searchable |
 | **preferences** | your standing orders, injected into the agent's prompt |
 
+## It produces things you can actually send
+
+```bash
+rsb invoice create --to "Riverside Cafe" \
+  --item "Deep clean x4 @ 300.00" --item "Call-out @ 175.50" \
+  --tax 8.25 --due "+30d" --render pdf
+```
+
+A real PDF, written by a ~150-line writer using the base-14 fonts with the actual
+Helvetica metrics — so right-aligned money columns line up. No headless browser, no
+LaTeX, no dependency. `--render html` and `--render md` are also there; Markdown is
+what you paste into Google Docs when you need an editable version.
+
+```bash
+rsb calendar     # artifacts/calendar.ics — RFC 5545, folded, CRLF, escaped
+```
+
+Only **confirmed** appointments are exported: a proposal the owner has not approved
+must never show up as a commitment. Subscribe live over HTTP and it lands in Google
+Calendar, Apple Calendar or Outlook with no OAuth and no vendor at all:
+
+```bash
+rsb serve --token "$TOKEN"
+# http://127.0.0.1:7431/$TOKEN/calendar.ics
+```
+
 ## Why an event log
 
 `events.jsonl` is append-only and hash-chained. Every record is a fold over that log,
@@ -223,11 +249,11 @@ said yes" is a fact rather than a claim. That's the whole idea.
 python3 tests/run.py
 ```
 
-70 tests, stdlib `unittest`, nothing to install. They cover the hash chain (including
+86 tests, stdlib `unittest`, nothing to install. They cover the hash chain (including
 tamper and deletion detection), phone/time/money parsing, HTML escaping, the MCP
 protocol, the grail agent ABI, tier-portability enforcement, cross-implementation
-interop, and a full end-to-end reproduction of the call → negotiate → call back →
-approve → confirm flow.
+interop, PDF structure (including xref offsets), RFC 5545 line folding, and a full
+end-to-end reproduction of the call → negotiate → call back → approve → confirm flow.
 
 ```bash
 ./examples/jarvis-restaurant-call.sh    # watch the whole flow run
